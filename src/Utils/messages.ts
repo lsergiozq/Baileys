@@ -3,9 +3,8 @@ import axios from 'axios'
 import { randomBytes } from 'crypto'
 import { promises as fs } from 'fs'
 import { Logger } from 'pino'
-import { type Transform } from 'stream'
 import { proto } from '../../WAProto'
-import { MEDIA_KEYS, URL_REGEX, WA_DEFAULT_EPHEMERAL } from '../Defaults'
+import { MEDIA_KEYS, URL_EXCLUDE_REGEX, URL_REGEX, WA_DEFAULT_EPHEMERAL } from '../Defaults'
 import {
 	AnyMediaMessageContent,
 	AnyMessageContent,
@@ -33,7 +32,6 @@ type MediaUploadData = {
 	media: WAMediaUpload
 	caption?: string
 	ptt?: boolean
-	ptv?: boolean
 	seconds?: number
 	gifPlayback?: boolean
 	fileName?: string
@@ -59,15 +57,19 @@ const MessageTypeProto = {
 	'video': WAProto.Message.VideoMessage,
 	'audio': WAProto.Message.AudioMessage,
 	'sticker': WAProto.Message.StickerMessage,
-   	'document': WAProto.Message.DocumentMessage,
+	'document': WAProto.Message.DocumentMessage,
 } as const
+
+const ButtonType = proto.Message.ButtonsMessage.HeaderType
 
 /**
  * Uses a regex to test whether the string contains a URL, and returns the URL if it does.
  * @param text eg. hello https://google.com
  * @returns the URL, eg. https://google.com
  */
-export const extractUrlFromText = (text: string) => text.match(URL_REGEX)?.[0]
+export const extractUrlFromText = (text: string) => (
+	!URL_EXCLUDE_REGEX.test(text) ? text.match(URL_REGEX)?.[0] : undefined
+)
 
 export const generateLinkPreviewIfRequired = async(text: string, getUrlInfo: MessageGenerationOptions['getUrlInfo'], logger: MessageGenerationOptions['logger']) => {
 	const url = extractUrlFromText(text)
@@ -120,9 +122,9 @@ export const prepareWAMessageMedia = async(
 	delete uploadData[mediaType]
 	// check if cacheable + generate cache key
 	const cacheableKey = typeof uploadData.media === 'object' &&
-			('url' in uploadData.media) &&
-			!!uploadData.media.url &&
-			!!options.mediaCache && (
+		('url' in uploadData.media) &&
+		!!uploadData.media.url &&
+		!!options.mediaCache && (
 	// generate the key
 		mediaType + ':' + uploadData.media.url.toString()
 	)
@@ -152,7 +154,7 @@ export const prepareWAMessageMedia = async(
 
 	const requiresDurationComputation = mediaType === 'audio' && typeof uploadData.seconds === 'undefined'
 	const requiresThumbnailComputation = (mediaType === 'image' || mediaType === 'video') &&
-										(typeof uploadData['jpegThumbnail'] === 'undefined')
+		(typeof uploadData['jpegThumbnail'] === 'undefined')
 	const requiresWaveformProcessing = mediaType === 'audio' && uploadData.ptt === true
 	const requiresAudioBackground = options.backgroundColor && mediaType === 'audio' && uploadData.ptt === true
 	const requiresOriginalForSomeProcessing = requiresDurationComputation || requiresThumbnailComputation
@@ -170,16 +172,21 @@ export const prepareWAMessageMedia = async(
 		{
 			logger,
 			saveOriginalFileIfRequired: requiresOriginalForSomeProcessing,
-			opts: options.options
+			opts: options.options,
+			newsletter: options.newsletter
 		}
 	)
-	 // url safe Base64 encode the SHA256 hash of the body
-	const fileEncSha256B64 = fileEncSha256.toString('base64')
-	const [{ mediaUrl, directPath }] = await Promise.all([
+	// url safe Base64 encode the SHA256 hash of the body
+	let fileEncSha256B64 = fileEncSha256.toString('base64')
+	if(options.newsletter) {
+		fileEncSha256B64 = fileSha256.toString('base64')
+	}
+
+	const [{ mediaUrl, directPath, handle }] = await Promise.all([
 		(async() => {
 			const result = await options.upload(
 				encWriteStream,
-				{ fileEncSha256B64, mediaType, timeoutMs: options.mediaUploadTimeoutMs }
+				{ fileEncSha256B64, mediaType, timeoutMs: options.mediaUploadTimeoutMs, newsletter: !!options.newsletter }
 			)
 			logger?.debug({ mediaType, cacheableKey }, 'uploaded media')
 			return result
@@ -245,6 +252,7 @@ export const prepareWAMessageMedia = async(
 				fileEncSha256,
 				fileSha256,
 				fileLength,
+				handle,
 				mediaKeyTimestamp: unixTimestampSeconds(),
 				...uploadData,
 				media: undefined
@@ -252,17 +260,12 @@ export const prepareWAMessageMedia = async(
 		)
 	})
 
-	if(uploadData.ptv) {
-		obj.ptvMessage = obj.videoMessage
-		delete obj.videoMessage
-	}
-
 	if(cacheableKey) {
 		logger?.debug({ cacheableKey }, 'set cache')
 		options.mediaCache!.set(cacheableKey, WAProto.Message.encode(obj).finish())
 	}
 
-	return obj
+	return { ...obj, handle }
 }
 
 export const prepareDisappearingMessageSettingContent = (ephemeralExpiration?: number) => {
@@ -342,12 +345,14 @@ export const generateWAMessageContent = async(
 			const img = urlInfo.highQualityThumbnail
 			if(img) {
 				extContent.thumbnailDirectPath = img.directPath
-				extContent.mediaKey = img.mediaKey
-				extContent.mediaKeyTimestamp = img.mediaKeyTimestamp
 				extContent.thumbnailWidth = img.width
 				extContent.thumbnailHeight = img.height
 				extContent.thumbnailSha256 = img.fileSha256
-				extContent.thumbnailEncSha256 = img.fileEncSha256
+				if(!options.newsletter) {
+					extContent.thumbnailEncSha256 = img.fileEncSha256
+					extContent.mediaKeyTimestamp = img.mediaKeyTimestamp
+					extContent.mediaKey = img.mediaKey
+				}
 			}
 		}
 
@@ -394,34 +399,6 @@ export const generateWAMessageContent = async(
 			(message.disappearingMessagesInChat ? WA_DEFAULT_EPHEMERAL : 0) :
 			message.disappearingMessagesInChat
 		m = prepareDisappearingMessageSettingContent(exp)
-	} else if('groupInvite' in message) {
-		m.groupInviteMessage = {}
-		m.groupInviteMessage.inviteCode = message.groupInvite.inviteCode
-		m.groupInviteMessage.inviteExpiration = message.groupInvite.inviteExpiration
-		m.groupInviteMessage.caption = message.groupInvite.text
-
-		m.groupInviteMessage.groupJid = message.groupInvite.jid
-		m.groupInviteMessage.groupName = message.groupInvite.subject
-		//TODO: use built-in interface and get disappearing mode info etc.
-		//TODO: cache / use store!?
-		if(options.getProfilePicUrl) {
-			const pfpUrl = await options.getProfilePicUrl(message.groupInvite.jid, 'preview')
-			if(pfpUrl) {
-				const resp = await axios.get(pfpUrl, { responseType: 'arraybuffer' })
-				if(resp.status === 200) {
-					m.groupInviteMessage.jpegThumbnail = resp.data
-				}
-			}
-		}
-	} else if('pin' in message) {
-		m.pinInChatMessage = {}
-		m.messageContextInfo = {}
-
-		m.pinInChatMessage.key = message.pin
-		m.pinInChatMessage.type = message.type
-		m.pinInChatMessage.senderTimestampMs = Date.now()
-
-		m.messageContextInfo.messageAddOnDurationInSecs = message.type === 1 ? message.time || 86400 : 0
 	} else if('buttonReply' in message) {
 		switch (message.type) {
 		case 'template':
@@ -439,12 +416,6 @@ export const generateWAMessageContent = async(
 			}
 			break
 		}
-	} else if('ptv' in message && message.ptv) {
-		const { videoMessage } = await prepareWAMessageMedia(
-			{ video: message.video },
-			options
-		)
-		m.ptvMessage = videoMessage
 	} else if('product' in message) {
 		const { imageMessage } = await prepareWAMessageMedia(
 			{ image: message.product.productImage },
@@ -461,7 +432,6 @@ export const generateWAMessageContent = async(
 		m.listResponseMessage = { ...message.listReply }
 	} else if('poll' in message) {
 		message.poll.selectableCount ||= 0
-		message.poll.toAnnouncementGroup ||= false
 
 		if(!Array.isArray(message.poll.values)) {
 			throw new Boom('Invalid poll values', { statusCode: 400 })
@@ -482,23 +452,10 @@ export const generateWAMessageContent = async(
 			messageSecret: message.poll.messageSecret || randomBytes(32),
 		}
 
-		const pollCreationMessage = {
+		m.pollCreationMessage = {
 			name: message.poll.name,
 			selectableOptionsCount: message.poll.selectableCount,
 			options: message.poll.values.map(optionName => ({ optionName })),
-		}
-
-		if (message.poll.toAnnouncementGroup) {
-			// poll v2 is for community announcement groups (single select and multiple)
-			m.pollCreationMessageV2 = pollCreationMessage
-		} else {
-			if(message.poll.selectableCount > 0) {
-				//poll v3 is for single select polls
-				m.pollCreationMessageV3 = pollCreationMessage
-			} else {
-				// poll v3 for multiple choice polls
-				m.pollCreationMessage = pollCreationMessage
-			}
 		}
 	} else if('sharePhoneNumber' in message) {
 		m.protocolMessage = {
@@ -513,13 +470,77 @@ export const generateWAMessageContent = async(
 		)
 	}
 
+	if('buttons' in message && !!message.buttons) {
+		const buttonsMessage: proto.Message.IButtonsMessage = {
+			buttons: message.buttons.map(b => ({ ...b, type: proto.Message.ButtonsMessage.Button.Type.RESPONSE }))
+		}
+		if('text' in message) {
+			buttonsMessage.contentText = message.text
+			buttonsMessage.headerType = ButtonType.EMPTY
+		} else {
+			if('caption' in message) {
+				buttonsMessage.contentText = message.caption
+			}
+
+			const type = Object.keys(m)[0].replace('Message', '').toUpperCase()
+			buttonsMessage.headerType = ButtonType[type]
+
+			Object.assign(buttonsMessage, m)
+		}
+
+		if('footer' in message && !!message.footer) {
+			buttonsMessage.footerText = message.footer
+		}
+
+		m = { buttonsMessage }
+	} else if('templateButtons' in message && !!message.templateButtons) {
+		const msg: proto.Message.TemplateMessage.IHydratedFourRowTemplate = {
+			hydratedButtons: message.templateButtons
+		}
+
+		if('text' in message) {
+			msg.hydratedContentText = message.text
+		} else {
+
+			if('caption' in message) {
+				msg.hydratedContentText = message.caption
+			}
+
+			Object.assign(msg, m)
+		}
+
+		if('footer' in message && !!message.footer) {
+			msg.hydratedFooterText = message.footer
+		}
+
+		m = {
+			templateMessage: {
+				fourRowTemplate: msg,
+				hydratedTemplate: msg
+			}
+		}
+	}
+
+	if('sections' in message && !!message.sections) {
+		const listMessage: proto.Message.IListMessage = {
+			sections: message.sections,
+			buttonText: message.buttonText,
+			title: message.title,
+			footerText: message.footer,
+			description: message.text,
+			listType: proto.Message.ListMessage.ListType.SINGLE_SELECT
+		}
+
+		m = { listMessage }
+	}
+
 	if('viewOnce' in message && !!message.viewOnce) {
 		m = { viewOnceMessage: { message: m } }
 	}
 
 	if('mentions' in message && message.mentions?.length) {
 		const [messageType] = Object.keys(m)
-		m[messageType].contextInfo = m[messageType] || { }
+		m[messageType].contextInfo = m[messageType] || {}
 		m[messageType].contextInfo.mentionedJid = message.mentions
 	}
 
@@ -554,8 +575,7 @@ export const generateWAMessageFromContent = (
 		options.timestamp = new Date()
 	}
 
-	const innerMessage = normalizeMessageContent(message)!
-	const key: string = getContentType(innerMessage)!
+	const key = Object.keys(message)[0]
 	const timestamp = unixTimestampSeconds(options.timestamp)
 	const { quoted, userJid } = options
 
@@ -572,7 +592,7 @@ export const generateWAMessageFromContent = (
 			delete quotedContent.contextInfo
 		}
 
-		const contextInfo: proto.IContextInfo = innerMessage[key].contextInfo || { }
+		const contextInfo: proto.IContextInfo = message[key].contextInfo || {}
 		contextInfo.participant = jidNormalizedUser(participant!)
 		contextInfo.stanzaId = quoted.key.id
 		contextInfo.quotedMessage = quotedMsg
@@ -583,7 +603,7 @@ export const generateWAMessageFromContent = (
 			contextInfo.remoteJid = quoted.key.remoteJid
 		}
 
-		innerMessage[key].contextInfo = contextInfo
+		message[key].contextInfo = contextInfo
 	}
 
 	if(
@@ -594,8 +614,8 @@ export const generateWAMessageFromContent = (
 		// already not converted to disappearing message
 		key !== 'ephemeralMessage'
 	) {
-		innerMessage[key].contextInfo = {
-			...(innerMessage[key].contextInfo || {}),
+		message[key].contextInfo = {
+			...(message[key].contextInfo || {}),
 			expiration: options.ephemeralExpiration || WA_DEFAULT_EPHEMERAL,
 			//ephemeralSettingTimestamp: options.ephemeralOptions.eph_setting_ts?.toString()
 		}
@@ -625,6 +645,10 @@ export const generateWAMessage = async(
 ) => {
 	// ensure msg ID is with every log
 	options.logger = options?.logger?.child({ msgId: options.messageId })
+	if(jid.includes('newsletter')) {
+		options.newsletter = true
+	}
+
 	return generateWAMessageFromContent(
 		jid,
 		await generateWAMessageContent(
@@ -651,32 +675,32 @@ export const getContentType = (content: WAProto.IMessage | undefined) => {
  * @returns
  */
 export const normalizeMessageContent = (content: WAMessageContent | null | undefined): WAMessageContent | undefined => {
-	 if(!content) {
-		 return undefined
-	 }
+	if(!content) {
+		return undefined
+	}
 
-	 // set max iterations to prevent an infinite loop
-	 for(let i = 0;i < 5;i++) {
-		 const inner = getFutureProofMessage(content)
-		 if(!inner) {
-			 break
-		 }
+	// set max iterations to prevent an infinite loop
+	for(let i = 0; i < 5; i++) {
+		const inner = getFutureProofMessage(content)
+		if(!inner) {
+			break
+		}
 
-		 content = inner.message
-	 }
+		content = inner.message
+	}
 
-	 return content!
+	return content!
 
-	 function getFutureProofMessage(message: typeof content) {
-		 return (
-			 message?.ephemeralMessage
-			 || message?.viewOnceMessage
-			 || message?.documentWithCaptionMessage
-			 || message?.viewOnceMessageV2
-			 || message?.viewOnceMessageV2Extension
-			 || message?.editedMessage
-		 )
-	 }
+	function getFutureProofMessage(message: typeof content) {
+		return (
+			message?.ephemeralMessage
+			|| message?.viewOnceMessage
+			|| message?.documentWithCaptionMessage
+			|| message?.viewOnceMessageV2
+			|| message?.viewOnceMessageV2Extension
+			|| message?.editedMessage
+		)
+	}
 }
 
 /**
@@ -706,7 +730,7 @@ export const extractMessageContent = (content: WAMessageContent | undefined | nu
 	content = normalizeMessageContent(content)
 
 	if(content?.buttonsMessage) {
-	  return extractFromTemplateMessage(content.buttonsMessage)
+		return extractFromTemplateMessage(content.buttonsMessage)
 	}
 
 	if(content?.templateMessage?.hydratedFourRowTemplate) {
@@ -822,7 +846,7 @@ export function getAggregateVotesInPollMessage(
 
 /** Given a list of message keys, aggregates them by chat & sender. Useful for sending read receipts in bulk */
 export const aggregateMessageKeysNotFromMe = (keys: proto.IMessageKey[]) => {
-	const keyMap: { [id: string]: { jid: string, participant: string | undefined, messageIds: string[] } } = { }
+	const keyMap: { [id: string]: { jid: string, participant: string | undefined, messageIds: string[] } } = {}
 	for(const { remoteJid, id, participant, fromMe } of keys) {
 		if(!fromMe) {
 			const uqKey = `${remoteJid}:${participant || ''}`
@@ -846,36 +870,32 @@ type DownloadMediaMessageContext = {
 	logger: Logger
 }
 
-const REUPLOAD_REQUIRED_STATUS = [410, 404]
+const REUPLOAD_REQUIRED_STATUS = [410, 404, 403]
 
 /**
  * Downloads the given message. Throws an error if it's not a media message
  */
-export const downloadMediaMessage = async<Type extends 'buffer' | 'stream'>(
+export const downloadMediaMessage = async(
 	message: WAMessage,
-	type: Type,
+	type: 'buffer' | 'stream',
 	options: MediaDownloadOptions,
 	ctx?: DownloadMediaMessageContext
 ) => {
-	const result = await downloadMsg()
-		.catch(async(error) => {
-			if(ctx) {
-				if(axios.isAxiosError(error)) {
-					// check if the message requires a reupload
-					if(REUPLOAD_REQUIRED_STATUS.includes(error.response?.status!)) {
-						ctx.logger.info({ key: message.key }, 'sending reupload media request...')
-						// request reupload
-						message = await ctx.reuploadRequest(message)
-						const result = await downloadMsg()
-						return result
-					}
-				}
-			}
+	try {
+		const result = await downloadMsg()
+		return result
+	} catch(error) {
+		if(ctx && axios.isAxiosError(error) && // check if the message requires a reupload
+				REUPLOAD_REQUIRED_STATUS.includes(error.response?.status!)) {
+			ctx.logger.info({ key: message.key }, 'sending reupload media request...')
+			// request reupload
+			message = await ctx.reuploadRequest(message)
+			const result = await downloadMsg()
+			return result
+		}
 
-			throw error
-		})
-
-	return result as Type extends 'buffer' ? Buffer : Transform
+		throw error
+	}
 
 	async function downloadMsg() {
 		const mContent = extractMessageContent(message.message)

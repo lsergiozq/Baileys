@@ -77,8 +77,6 @@ async function connectToWhatsApp () {
         }
     })
     sock.ev.on('messages.upsert', m => {
-        console.log(JSON.stringify(m, undefined, 2))
-
         console.log('replying to', m.messages[0].key.remoteJid)
         await sock.sendMessage(m.messages[0].key.remoteJid!, { text: 'Hello there!' })
     })
@@ -324,13 +322,13 @@ const sock = makeWASocket({ })
 // the store can listen from a new socket once the current socket outlives its lifetime
 store.bind(sock.ev)
 
-sock.ev.on('chats.upsert', () => {
+sock.ev.on('chats.set', () => {
     // can use "store.chats" however you want, even after the socket dies out
     // "chats" => a KeyedDB instance
     console.log('got chats', store.chats.all())
 })
 
-sock.ev.on('contacts.upsert', () => {
+sock.ev.on('contacts.set', () => {
     console.log('got contacts', Object.values(store.contacts))
 })
 
@@ -422,8 +420,7 @@ await sock.sendMessage(
     { 
         video: "./Media/ma_gif.mp4", 
         caption: "hello!",
-        gifPlayback: true,
-	ptv: false // if set to true, will send as a `video note`
+        gifPlayback: true
     }
 )
 
@@ -835,7 +832,7 @@ Of course, replace ``` xyz ``` with an actual ID.
     ```
 - To update the Groups Add privacy
     ``` ts
-    const value = 'all' // 'contacts' | 'contact_blacklist'
+    const value = 'all' // 'contacts' | 'contact_blacklist' | 'none'
     await sock.updateGroupsAddPrivacy(value)
     ```
 - To update the Default Disappearing Mode

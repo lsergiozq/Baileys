@@ -29,11 +29,10 @@ import {
 	getCodeFromWSError,
 	getErrorCodeFromStreamError,
 	getNextPreKeysNode,
-	getPlatformId,
 	makeEventBuffer,
 	makeNoiseHandler,
 	printQRIfNecessaryListener,
-	promiseTimeout,
+	promiseTimeout
 } from '../Utils'
 import {
 	assertNodeErrorFree,
@@ -135,7 +134,7 @@ export const makeSocket = (config: SocketConfig) => {
 	/** send a binary node */
 	const sendNode = (frame: BinaryNode) => {
 		if(logger.level === 'trace') {
-			logger.trace({ xml: binaryNodeToString(frame), msg: 'xml send' })
+			logger.trace(binaryNodeToString(frame), 'xml send')
 		}
 
 		const buff = encodeBinaryNode(frame)
@@ -312,7 +311,7 @@ export const makeSocket = (config: SocketConfig) => {
 		}
 	}
 
-	const onMessageReceived = (data: Buffer) => {
+	const onMessageRecieved = (data: Buffer) => {
 		noise.decodeFrame(data, frame => {
 			// reset ping timeout
 			lastDateRecv = new Date()
@@ -325,7 +324,7 @@ export const makeSocket = (config: SocketConfig) => {
 				const msgId = frame.attrs.id
 
 				if(logger.level === 'trace') {
-					logger.trace({ xml: binaryNodeToString(frame), msg: 'recv xml' })
+					logger.trace(binaryNodeToString(frame), 'recv xml')
 				}
 
 				/* Check if this is a response to a message we sent */
@@ -335,11 +334,12 @@ export const makeSocket = (config: SocketConfig) => {
 				const l1 = frame.attrs || {}
 				const l2 = Array.isArray(frame.content) ? frame.content[0]?.tag : ''
 
-				Object.keys(l1).forEach(key => {
+				for(const key of Object.keys(l1)) {
 					anyTriggered = ws.emit(`${DEF_CALLBACK_PREFIX}${l0},${key}:${l1[key]},${l2}`, frame) || anyTriggered
 					anyTriggered = ws.emit(`${DEF_CALLBACK_PREFIX}${l0},${key}:${l1[key]}`, frame) || anyTriggered
 					anyTriggered = ws.emit(`${DEF_CALLBACK_PREFIX}${l0},${key}`, frame) || anyTriggered
-				})
+				}
+
 				anyTriggered = ws.emit(`${DEF_CALLBACK_PREFIX}${l0},,${l2}`, frame) || anyTriggered
 				anyTriggered = ws.emit(`${DEF_CALLBACK_PREFIX}${l0}`, frame) || anyTriggered
 
@@ -372,6 +372,9 @@ export const makeSocket = (config: SocketConfig) => {
 
 		if(!ws.isClosed && !ws.isClosing) {
 			try {
+				ws.on('error', (err) => {
+					logger.error({ err: err })
+				})
 				ws.close()
 			} catch{ }
 		}
@@ -526,7 +529,7 @@ export const makeSocket = (config: SocketConfig) => {
 						{
 							tag: 'companion_platform_id',
 							attrs: {},
-							content: getPlatformId(browser[1])
+							content: '49' // Chrome
 						},
 						{
 							tag: 'companion_platform_display',
@@ -548,31 +551,12 @@ export const makeSocket = (config: SocketConfig) => {
 	async function generatePairingKey() {
 		const salt = randomBytes(32)
 		const randomIv = randomBytes(16)
-		const key = await derivePairingCodeKey(authState.creds.pairingCode!, salt)
+		const key = derivePairingCodeKey(authState.creds.pairingCode!, salt)
 		const ciphered = aesEncryptCTR(authState.creds.pairingEphemeralKeyPair.public, key, randomIv)
 		return Buffer.concat([salt, randomIv, ciphered])
 	}
 
-	const sendWAMBuffer = (wamBuffer: Buffer) => {
-		return query({
-			tag: 'iq',
-			attrs: {
-				to: S_WHATSAPP_NET,
-				id: generateMessageTag(),
-				xmlns: 'w:stats'
-			},
-			content: [
-				{
-					tag: 'add',
-					attrs: {},
-					content: wamBuffer
-				}
-			]
-		})
-	}
-
-	ws.on('message', onMessageReceived)
-
+	ws.on('message', onMessageRecieved)
 	ws.on('open', async() => {
 		try {
 			await validateConnection()
@@ -682,8 +666,26 @@ export const makeSocket = (config: SocketConfig) => {
 		const routingInfo = getBinaryNodeChild(edgeRoutingNode, 'routing_info')
 		if(routingInfo?.content) {
 			authState.creds.routingInfo = Buffer.from(routingInfo?.content as Uint8Array)
-			ev.emit('creds.update', authState.creds)
 		}
+	})
+
+	ws.on('CB:ib,,offline_preview', (node: BinaryNode) => {
+		const offlinePreviewNode = getBinaryNodeChild(node, 'offline_preview')
+		const previewCount = +(offlinePreviewNode?.attrs.count || 0)
+		const appDataChanges = +(offlinePreviewNode?.attrs.appdata || 0)
+		const messageCount = +(offlinePreviewNode?.attrs.message || 0)
+		const notificationCount = +(offlinePreviewNode?.attrs.notification || 0)
+		const receiptCount = +(offlinePreviewNode?.attrs.receipt || 0)
+
+		logger.info(`appdata changes: ${appDataChanges}, messages: ${messageCount}, notifications: ${notificationCount}, receipts: ${receiptCount}`)
+
+		ev.emit('offline.preview', {
+			total: previewCount,
+			appDataChanges,
+			messages: messageCount,
+			notifications: notificationCount,
+			receipts: receiptCount
+		})
 	})
 
 	let didStartBuffer = false
@@ -757,7 +759,7 @@ export const makeSocket = (config: SocketConfig) => {
 		requestPairingCode,
 		/** Waits for the connection to WA to reach a state */
 		waitForConnectionUpdate: bindWaitForConnectionUpdate(ev),
-		sendWAMBuffer,
+		startKeepAliveRequest
 	}
 }
 

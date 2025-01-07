@@ -1,14 +1,12 @@
 import { Boom } from '@hapi/boom'
-import NodeCache from 'node-cache'
 import { proto } from '../../WAProto'
-import { DEFAULT_CACHE_TTLS, PROCESSABLE_HISTORY_TYPES } from '../Defaults'
-import { ALL_WA_PATCH_NAMES, ChatModification, ChatMutation, LTHashState, MessageUpsertType, PresenceData, SocketConfig, WABusinessHoursConfig, WABusinessProfile, WAMediaUpload, WAMessage, WAPatchCreate, WAPatchName, WAPresence, WAPrivacyCallValue, WAPrivacyGroupAddValue, WAPrivacyOnlineValue, WAPrivacyValue, WAReadReceiptsValue } from '../Types'
+import { PROCESSABLE_HISTORY_TYPES } from '../Defaults'
+import { ALL_WA_PATCH_NAMES, ChatModification, ChatMutation, LTHashState, MessageUpsertType, PresenceData, SocketConfig, WABusinessHoursConfig, WABusinessProfile, WAMediaUpload, WAMessage, WAPatchCreate, WAPatchName, WAPresence, WAPrivacyOnlineValue, WAPrivacyValue, WAReadReceiptsValue } from '../Types'
 import { chatModificationToAppPatch, ChatMutationMap, decodePatches, decodeSyncdSnapshot, encodeSyncdPatch, extractSyncdPatches, generateProfilePicture, getHistoryMsg, newLTHashState, processSyncAction } from '../Utils'
 import { makeMutex } from '../Utils/make-mutex'
 import processMessage from '../Utils/process-message'
 import { BinaryNode, getBinaryNodeChild, getBinaryNodeChildren, jidNormalizedUser, reduceBinaryNodeToDictionary, S_WHATSAPP_NET } from '../WABinary'
 import { makeSocket } from './socket'
-import { Label, LabelActionBody } from '../Types/Label'
 
 const MAX_SYNC_ATTEMPTS = 2
 
@@ -38,22 +36,13 @@ export const makeChatsSocket = (config: SocketConfig) => {
 	/** this mutex ensures that the notifications (receipts, messages etc.) are processed in order */
 	const processingMutex = makeMutex()
 
-	const placeholderResendCache = config.placeholderResendCache || new NodeCache({
-		stdTTL: DEFAULT_CACHE_TTLS.MSG_RETRY, // 1 hour
-		useClones: false
-	})
-
-	if(!config.placeholderResendCache) {
-		config.placeholderResendCache = placeholderResendCache
-	}
-
 	/** helper function to fetch the given app state sync key */
 	const getAppStateSyncKey = async(keyId: string) => {
 		const { [keyId]: key } = await authState.keys.get('app-state-sync-key', [keyId])
 		return key
 	}
 
-	const fetchPrivacySettings = async(force = false) => {
+	const fetchPrivacySettings = async(force: boolean = false) => {
 		if(!privacySettings || force) {
 			const { content } = await query({
 				tag: 'iq',
@@ -94,16 +83,28 @@ export const makeChatsSocket = (config: SocketConfig) => {
 		})
 	}
 
-	const updateCallPrivacy = async(value: WAPrivacyCallValue) => {
-		await privacyQuery('calladd', value)
-	}
-
 	const updateLastSeenPrivacy = async(value: WAPrivacyValue) => {
 		await privacyQuery('last', value)
 	}
 
 	const updateOnlinePrivacy = async(value: WAPrivacyOnlineValue) => {
 		await privacyQuery('online', value)
+	}
+
+	const fetchDisappearingDuration = async(...jids: string[]) => {
+		const list = jids.map((jid) => ({ tag: 'user', attrs: { jid } }))
+		const results = await interactiveQuery(
+			list,
+			{ tag: 'disappearing_mode', attrs: {} }
+		)
+		return results.map(item => {
+			const result = getBinaryNodeChild(item, 'disappearing_mode')
+			return {
+				user: item.attrs.jid,
+				duration: parseInt((result as any)?.attrs.duration),
+				setAt: new Date(+(result?.attrs.t || 0) * 1000)
+			}
+		})
 	}
 
 	const updateProfilePicturePrivacy = async(value: WAPrivacyValue) => {
@@ -118,7 +119,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 		await privacyQuery('readreceipts', value)
 	}
 
-	const updateGroupsAddPrivacy = async(value: WAPrivacyGroupAddValue) => {
+	const updateGroupsAddPrivacy = async(value: WAPrivacyValue) => {
 		await privacyQuery('groupadd', value)
 	}
 
@@ -221,21 +222,11 @@ export const makeChatsSocket = (config: SocketConfig) => {
 
 	/** update the profile picture for yourself or a group */
 	const updateProfilePicture = async(jid: string, content: WAMediaUpload) => {
-		let targetJid;
-		if(!jid) {
-			throw new Boom('Illegal no-jid profile update. Please specify either your ID or the ID of the chat you wish to update')
-		}
-
-		if(jidNormalizedUser(jid) !== jidNormalizedUser(authState.creds.me!.id)) {
-			targetJid = jidNormalizedUser(jid) // in case it is someone other than us
-		}
-
 		const { img } = await generateProfilePicture(content)
 		await query({
 			tag: 'iq',
 			attrs: {
-				target: targetJid,
-				to: S_WHATSAPP_NET,
+				to: jidNormalizedUser(jid),
 				type: 'set',
 				xmlns: 'w:profile:picture'
 			},
@@ -251,20 +242,10 @@ export const makeChatsSocket = (config: SocketConfig) => {
 
 	/** remove the profile picture for yourself or a group */
 	const removeProfilePicture = async(jid: string) => {
-		let targetJid;
-		if(!jid) {
-			throw new Boom('Illegal no-jid profile update. Please specify either your ID or the ID of the chat you wish to update')
-		}
-
-		if(jidNormalizedUser(jid) !== jidNormalizedUser(authState.creds.me!.id)) {
-			targetJid = jidNormalizedUser(jid) // in case it is someone other than us
-		}
-
 		await query({
 			tag: 'iq',
 			attrs: {
-				target: targetJid,
-				to: S_WHATSAPP_NET,
+				to: jidNormalizedUser(jid),
 				type: 'set',
 				xmlns: 'w:profile:picture'
 			}
@@ -576,7 +557,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 	const sendPresenceUpdate = async(type: WAPresence, toJid?: string) => {
 		const me = authState.creds.me!
 		if(type === 'available' || type === 'unavailable') {
-			if(!me.name) {
+			if(!me!.name) {
 				logger.warn('no name present, ignoring presence update request...')
 				return
 			}
@@ -586,7 +567,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 			await sendNode({
 				tag: 'presence',
 				attrs: {
-					name: me.name,
+					name: me!.name,
 					type
 				}
 			})
@@ -594,7 +575,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 			await sendNode({
 				tag: 'chatstate',
 				attrs: {
-					from: me.id,
+					from: me!.id!,
 					to: toJid!,
 				},
 				content: [
@@ -636,7 +617,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 		const jid = attrs.from
 		const participant = attrs.participant || attrs.from
 
-		if(shouldIgnoreJid(jid) && jid !== '@s.whatsapp.net') {
+		if(shouldIgnoreJid(jid) && jid != '@s.whatsapp.net') {
 			return
 		}
 
@@ -773,7 +754,10 @@ export const makeChatsSocket = (config: SocketConfig) => {
 
 		let props: { [_: string]: string } = {}
 		if(propsNode) {
-			authState.creds.lastPropHash = propsNode?.attrs?.hash
+			if(propsNode.attrs?.hash) {
+				authState.creds.lastPropHash = propsNode.attrs.hash
+			}
+
 			ev.emit('creds.update', authState.creds)
 			props = reduceBinaryNodeToDictionary(propsNode, 'prop')
 		}
@@ -801,17 +785,6 @@ export const makeChatsSocket = (config: SocketConfig) => {
 			star: {
 				messages,
 				star
-			}
-		}, jid)
-	}
-
-	/**
-	 * Adds label
-	 */
-	const addLabel = (jid: string, labels: LabelActionBody) => {
-		return chatModify({
-			addLabel: {
-				...labels
 			}
 		}, jid)
 	}
@@ -887,7 +860,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 
 			// update our pushname too
 			if(msg.key.fromMe && msg.pushName && authState.creds.me?.name !== msg.pushName) {
-				ev.emit('creds.update', { me: { ...authState.creds.me!, name: msg.pushName } })
+				ev.emit('creds.update', { me: { ...authState.creds.me!, name: msg.pushName! } })
 			}
 		}
 
@@ -918,7 +891,6 @@ export const makeChatsSocket = (config: SocketConfig) => {
 				msg,
 				{
 					shouldProcessHistoryMsg,
-					placeholderResendCache,
 					ev,
 					creds: authState.creds,
 					keyStore: authState.keys,
@@ -1020,11 +992,11 @@ export const makeChatsSocket = (config: SocketConfig) => {
 		fetchBlocklist,
 		fetchStatus,
 		updateProfilePicture,
+		fetchDisappearingDuration,
 		removeProfilePicture,
 		updateProfileStatus,
 		updateProfileName,
 		updateBlockStatus,
-		updateCallPrivacy,
 		updateLastSeenPrivacy,
 		updateOnlinePrivacy,
 		updateProfilePicturePrivacy,
@@ -1036,7 +1008,6 @@ export const makeChatsSocket = (config: SocketConfig) => {
 		resyncAppState,
 		chatModify,
 		cleanDirtyBits,
-		addLabel,
 		addChatLabel,
 		removeChatLabel,
 		addMessageLabel,

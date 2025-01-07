@@ -165,8 +165,8 @@ export const makeGroupsSocket = (config: SocketConfig) => {
 				}]
 			)
 			const node = getBinaryNodeChild(result, 'membership_requests_action')
-			const nodeAction = getBinaryNodeChild(node, action)
-			const participantsAffected = getBinaryNodeChildren(nodeAction, 'participant')
+			const nodeAction = getBinaryNodeChild(node!, action)
+			const participantsAffected = getBinaryNodeChildren(nodeAction!, 'participant')
 			return participantsAffected.map(p => {
 				return { status: p.attrs.error || '200', jid: p.attrs.jid }
 			})
@@ -191,7 +191,7 @@ export const makeGroupsSocket = (config: SocketConfig) => {
 				]
 			)
 			const node = getBinaryNodeChild(result, action)
-			const participantsAffected = getBinaryNodeChildren(node, 'participant')
+			const participantsAffected = getBinaryNodeChildren(node!, 'participant')
 			return participantsAffected.map(p => {
 				return { status: p.attrs.error || '200', jid: p.attrs.jid, content: p }
 			})
@@ -207,7 +207,7 @@ export const makeGroupsSocket = (config: SocketConfig) => {
 					{
 						tag: 'description',
 						attrs: {
-							...(description ? { id: generateMessageID() } : { delete: 'true' }),
+							...(description ? { id: generateMessageIDV2(sock.user?.id) } : { delete: 'true' }),
 							...(prev ? { prev } : {})
 						},
 						content: description ? [
@@ -232,18 +232,6 @@ export const makeGroupsSocket = (config: SocketConfig) => {
 			const result = getBinaryNodeChild(results, 'group')
 			return result?.attrs.jid
 		},
-
-		/**
-		 * revoke a v4 invite for someone
-		 * @param groupJid group jid
-		 * @param invitedJid jid of person you invited
-		 * @returns true if successful
-		 */
-		groupRevokeInviteV4: async(groupJid: string, invitedJid: string) => {
-			const result = await groupQuery(groupJid, 'set', [{ tag: 'revoke', attrs: {}, content: [{ tag: 'participant', attrs: { jid: invitedJid } }] }])
-			return !!result
-		},
-
 		/**
 		 * accept a GroupInviteMessage
 		 * @param key the key of the invite message, or optionally only provide the jid of the person who sent the invite
@@ -347,7 +335,6 @@ export const extractGroupMetadata = (result: BinaryNode) => {
 		owner: group.attrs.creator ? jidNormalizedUser(group.attrs.creator) : undefined,
 		desc,
 		descId,
-		linkedParent: getBinaryNodeChild(group, 'linked_parent')?.attrs.jid || undefined,
 		restrict: !!getBinaryNodeChild(group, 'locked'),
 		announce: !!getBinaryNodeChild(group, 'announcement'),
 		isCommunity: !!getBinaryNodeChild(group, 'parent'),

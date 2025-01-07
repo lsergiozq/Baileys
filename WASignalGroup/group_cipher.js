@@ -99,7 +99,6 @@ class GroupCipher {
       const plaintext = crypto.decrypt(key, ciphertext, iv);
       return plaintext;
     } catch (e) {
-      //console.log(e.stack);
       throw new Error('InvalidMessageException');
     }
   }
@@ -111,7 +110,6 @@ class GroupCipher {
       const crypted = crypto.encrypt(key, Buffer.from(plaintext), iv);
       return crypted;
     } catch (e) {
-      //console.log(e.stack);
       throw new Error('InvalidMessageException');
     }
   }
